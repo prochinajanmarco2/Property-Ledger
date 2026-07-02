@@ -1,0 +1,576 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Property &amp; Stock Ledger</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: #141a1f; }
+  body { font-family: 'Inter', -apple-system, sans-serif; color: #c5d1d6; }
+  input:focus, select:focus { border-color: #4f9d8f !important; }
+  ::placeholder { color: #4a5a63; }
+  #root { min-height: 100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+
+const { useState, useEffect, useMemo, useCallback } = React;
+
+// ---------- constants ----------
+const CLASS = { CONSUMABLE: 'Consumable', SEMI_EXPENDABLE: 'Semi-Expendable', PPE: 'PPE' };
+const DOC_BY_TYPE = {
+  RECEIPT: ['IAR'],
+  ISSUANCE: { [CLASS.CONSUMABLE]: 'RIS', [CLASS.SEMI_EXPENDABLE]: 'ICS', [CLASS.PPE]: 'PAR' },
+  TRANSFER_OUT: ['ITR'], TRANSFER_IN: ['ITR'], ADJUSTMENT: ['ADJ'],
+};
+const TX_TYPES = [
+  { value: 'RECEIPT', label: 'Receipt (from IAR)', sign: 1 },
+  { value: 'ISSUANCE', label: 'Issuance', sign: -1 },
+  { value: 'TRANSFER_IN', label: 'Transfer In', sign: 1 },
+  { value: 'TRANSFER_OUT', label: 'Transfer Out', sign: -1 },
+  { value: 'ADJUSTMENT', label: 'Adjustment (+/-)', sign: 0 },
+];
+const uid = () => Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
+const fmtDate = (d) => { if (!d) return ''; const dt = new Date(d.slice(0,10) + 'T00:00:00'); return dt.toLocaleDateString('en-PH', { year: 'numeric', month: 'short', day: 'numeric' }); };
+const todayISO = () => new Date().toISOString().slice(0, 10);
+const weekStart = (dateStr) => { const d = new Date(dateStr.slice(0,10) + 'T00:00:00'); const day = d.getDay(); const diff = d.getDate() - day + (day === 0 ? -6 : 1); const m = new Date(d.setDate(diff)); return m.toISOString().slice(0,10); };
+const monthKey = (dateStr) => dateStr.slice(0, 7);
+
+const API = '/api';
+async function apiGet(path) { const r = await fetch(API + path); if (!r.ok) throw new Error('Request failed'); return r.json(); }
+async function apiPost(path, body) { const r = await fetch(API + path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }); if (!r.ok) { const e = await r.json().catch(()=>({error:'Request failed'})); throw new Error(e.error || 'Request failed'); } return r.json(); }
+async function apiDelete(path) { const r = await fetch(API + path, { method: 'DELETE' }); if (!r.ok) throw new Error('Request failed'); return r.json(); }
+
+function App() {
+  const [items, setItems] = useState([]);
+  const [transactions, setTransactions] = useState([]);
+  const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState(null);
+  const [view, setView] = useState('dashboard');
+  const [selectedItemId, setSelectedItemId] = useState(null);
+  const [search, setSearch] = useState('');
+  const [toast, setToast] = useState(null);
+  const [showItemForm, setShowItemForm] = useState(false);
+
+  const refresh = useCallback(async () => {
+    try {
+      const [it, tx] = await Promise.all([apiGet('/items'), apiGet('/transactions')]);
+      setItems(it.map(i => ({ ...i })));
+      setTransactions(tx.map(t => ({ ...t, itemId: t.item_id, docType: t.doc_type, docNumber: t.doc_number, qty: Number(t.qty), date: t.date.slice(0,10) })));
+      setLoaded(true);
+    } catch (e) {
+      setLoadError(e.message);
+      setLoaded(true);
+    }
+  }, []);
+
+  useEffect(() => { refresh(); }, [refresh]);
+
+  const showToast = (msg, kind = 'success') => { setToast({ msg, kind }); setTimeout(() => setToast(null), 2800); };
+
+  const cardsByItem = useMemo(() => {
+    const map = {}; for (const it of items) map[it.id] = [];
+    const sorted = [...transactions].sort((a, b) => (a.date + a.created_at).localeCompare(b.date + b.created_at));
+    const runningQty = {};
+    for (const t of sorted) {
+      if (!map[t.itemId]) continue;
+      const prev = runningQty[t.itemId] || 0;
+      let delta = 0;
+      const meta = TX_TYPES.find(x => x.value === t.type);
+      if (t.type === 'ADJUSTMENT') delta = Number(t.qty);
+      else delta = meta.sign * Math.abs(Number(t.qty));
+      const bal = prev + delta;
+      runningQty[t.itemId] = bal;
+      map[t.itemId].push({ ...t, delta, balance: bal });
+    }
+    return map;
+  }, [items, transactions]);
+
+  const balanceOf = (itemId) => { const c = cardsByItem[itemId]; return c && c.length ? c[c.length - 1].balance : 0; };
+
+  const addItem = async (item) => {
+    if (!item.code || !item.name) { showToast('Code and name are required', 'error'); return; }
+    if (items.some(i => i.code.toLowerCase() === item.code.toLowerCase())) { showToast('Item code already exists', 'error'); return; }
+    try {
+      await apiPost('/items', { ...item, id: uid() });
+      await refresh();
+      showToast('Item added to registry');
+      setShowItemForm(false);
+    } catch (e) { showToast(e.message, 'error'); }
+  };
+
+  const addTransaction = async (tx) => {
+    if (!tx.itemId || !tx.date || !tx.qty || Number(tx.qty) === 0) { showToast('Item, date, and non-zero quantity are required', 'error'); return; }
+    const item = items.find(i => i.id === tx.itemId);
+    if (!item) return;
+    if (tx.type !== 'ADJUSTMENT') {
+      const meta = TX_TYPES.find(x => x.value === tx.type);
+      const projected = balanceOf(tx.itemId) + meta.sign * Math.abs(Number(tx.qty));
+      if (projected < 0) { showToast('Would result in negative balance (current: ' + balanceOf(tx.itemId) + '). Check quantity.', 'error'); return; }
+    }
+    try {
+      await apiPost('/transactions', { ...tx, id: uid() });
+      await refresh();
+      showToast(tx.type.replace('_', ' ') + ' posted for ' + item.name);
+    } catch (e) { showToast(e.message, 'error'); }
+  };
+
+  const deleteTransaction = async (id) => {
+    try { await apiDelete('/transactions/' + id); await refresh(); showToast('Entry removed'); }
+    catch (e) { showToast(e.message, 'error'); }
+  };
+
+  const filteredItems = items.filter(i => i.name.toLowerCase().includes(search.toLowerCase()) || i.code.toLowerCase().includes(search.toLowerCase()));
+
+  const generateReport = (classification, periodType) => {
+    const relevantItems = items.filter(i => i.classification === classification).map(i => i.id);
+    const issuances = transactions.filter(t => t.type === 'ISSUANCE' && relevantItems.includes(t.itemId));
+    const groups = {};
+    for (const t of issuances) {
+      const key = periodType === 'week' ? weekStart(t.date) : monthKey(t.date);
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(t);
+    }
+    return groups;
+  };
+
+  if (!loaded) {
+    return <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#8fa3ad', fontFamily: 'ui-monospace, monospace' }}>Loading ledger…</div>;
+  }
+  if (loadError) {
+    return (
+      <div style={{ minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#d9645c', fontFamily: 'ui-monospace, monospace', textAlign: 'center', padding: 20 }}>
+        Could not reach the server: {loadError}<br/>Check that the backend and database are running.
+      </div>
+    );
+  }
+
+  return (
+    <div style={styles.app}>
+      <Sidebar view={view} setView={setView} />
+      <main style={styles.main}>
+        <TopBar view={view} search={search} setSearch={setSearch} onNewItem={() => setShowItemForm(true)} />
+        <div style={styles.content}>
+          {view === 'dashboard' && <Dashboard items={items} transactions={transactions} balanceOf={balanceOf} setView={setView} />}
+          {view === 'items' && <ItemsList items={filteredItems} balanceOf={balanceOf} onSelect={(id) => { setSelectedItemId(id); setView('card'); }} />}
+          {view === 'card' && selectedItemId && <ItemCard item={items.find(i => i.id === selectedItemId)} rows={cardsByItem[selectedItemId] || []} onBack={() => setView('items')} onDelete={deleteTransaction} />}
+          {view === 'entry' && <TransactionEntry items={items} onSubmit={addTransaction} balanceOf={balanceOf} />}
+          {view === 'reports' && <Reports items={items} generateReport={generateReport} />}
+        </div>
+      </main>
+      {showItemForm && <ItemFormModal onClose={() => setShowItemForm(false)} onSubmit={addItem} />}
+      {toast && <Toast msg={toast.msg} kind={toast.kind} />}
+    </div>
+  );
+}
+
+function Sidebar({ view, setView }) {
+  const navItems = [
+    { key: 'dashboard', label: 'Dashboard' },
+    { key: 'items', label: 'Item Registry' },
+    { key: 'entry', label: 'Post Transaction' },
+    { key: 'reports', label: 'RSMI / RSPI' },
+  ];
+  return (
+    <nav style={styles.sidebar}>
+      <div style={styles.brandBlock}>
+        <div style={styles.brandMark}>PC</div>
+        <div>
+          <div style={styles.brandTitle}>Property &amp; Stock Ledger</div>
+          <div style={styles.brandSub}>Perpetual Card System</div>
+        </div>
+      </div>
+      <div style={{ marginTop: 28 }}>
+        {navItems.map(({ key, label }) => (
+          <button key={key} onClick={() => setView(key)} style={{ ...styles.navBtn, ...(view === key || (view === 'card' && key === 'items') ? styles.navBtnActive : {}) }}>
+            <span>{label}</span>
+          </button>
+        ))}
+      </div>
+      <div style={styles.sidebarFoot}>
+        <div style={{ fontSize: 11, color: '#5c7079', lineHeight: 1.5 }}>
+          Every entry maps to a source document — IAR, RIS, ICS, PAR, or ITR — per GAM for NGAs. Balances are computed, never hand-entered.
+        </div>
+      </div>
+    </nav>
+  );
+}
+
+function TopBar({ view, search, setSearch, onNewItem }) {
+  const titles = { dashboard: 'Dashboard', items: 'Item Registry', card: 'Item Card', entry: 'Post a Transaction', reports: 'RSMI / RSPI Reports' };
+  return (
+    <div style={styles.topbar}>
+      <div style={styles.topbarTitle}>{titles[view] || ''}</div>
+      <div style={{ display: 'flex', gap: 10, alignItems: 'center' }}>
+        {view === 'items' && (
+          <React.Fragment>
+            <div style={styles.searchBox}>
+              <input placeholder="Search code or name…" value={search} onChange={e => setSearch(e.target.value)} style={styles.searchInput} />
+            </div>
+            <button style={styles.primaryBtnSm} onClick={onNewItem}>+ New Item</button>
+          </React.Fragment>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function Dashboard({ items, transactions, balanceOf, setView }) {
+  const byClass = (c) => items.filter(i => i.classification === c);
+  const totalTx = transactions.length;
+  const recent = [...transactions].sort((a, b) => b.created_at.localeCompare(a.created_at)).slice(0, 8);
+  const lowStock = items.filter(i => i.classification === CLASS.CONSUMABLE && balanceOf(i.id) <= 5);
+
+  return (
+    <div>
+      <div style={styles.statGrid}>
+        <StatCard label="Consumables" value={byClass(CLASS.CONSUMABLE).length} sub="tracked items" accent="#4f9d8f" />
+        <StatCard label="Semi-Expendable" value={byClass(CLASS.SEMI_EXPENDABLE).length} sub="tracked items" accent="#c98a3e" />
+        <StatCard label="PPE" value={byClass(CLASS.PPE).length} sub="tracked items" accent="#7a6fd6" />
+        <StatCard label="Total Postings" value={totalTx} sub="all-time entries" accent="#5c8fc9" />
+      </div>
+      {lowStock.length > 0 && (
+        <div style={styles.alertBox}>
+          <div>
+            <div style={{ fontWeight: 600, fontSize: 13.5, color: '#e8ecee' }}>Low balance on {lowStock.length} consumable item{lowStock.length > 1 ? 's' : ''}</div>
+            <div style={{ fontSize: 12.5, color: '#8fa3ad', marginTop: 2 }}>{lowStock.map(i => i.name).join(', ')}</div>
+          </div>
+        </div>
+      )}
+      <div style={styles.twoCol}>
+        <div style={styles.panel}>
+          <div style={styles.panelHead}>Recent Postings</div>
+          {recent.length === 0 ? <EmptyState text="No transactions posted yet. Post your first IAR or issuance to begin the ledger." /> : (
+            <div>
+              {recent.map(t => {
+                const item = items.find(i => i.id === t.itemId);
+                return (
+                  <div key={t.id} style={styles.txRow}>
+                    <div style={{ ...styles.txTypeBadge, ...badgeStyle(t.type) }}>{t.type.replace('_', ' ')}</div>
+                    <div style={{ flex: 1, marginLeft: 12 }}>
+                      <div style={{ fontSize: 13.5, color: '#e8ecee' }}>{item ? item.name : '—'}</div>
+                      <div style={{ fontSize: 11.5, color: '#5c7079', marginTop: 2 }}>{t.docType} #{t.docNumber || '—'} · {fmtDate(t.date)}</div>
+                    </div>
+                    <div style={{ fontSize: 13.5, fontFamily: 'ui-monospace, monospace', color: '#c5d1d6' }}>{t.qty}</div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+        <div style={styles.panel}>
+          <div style={styles.panelHead}>Quick Actions</div>
+          <button style={styles.quickAction} onClick={() => setView('entry')}>
+            <div><div style={{ fontWeight: 600, fontSize: 13.5 }}>Post a Transaction</div><div style={{ fontSize: 11.5, color: '#5c7079' }}>Record a new IAR, RIS, ICS, PAR, or ITR</div></div>
+          </button>
+          <button style={styles.quickAction} onClick={() => setView('items')}>
+            <div><div style={{ fontWeight: 600, fontSize: 13.5 }}>Browse Item Registry</div><div style={{ fontSize: 11.5, color: '#5c7079' }}>View any item's live card and running balance</div></div>
+          </button>
+          <button style={styles.quickAction} onClick={() => setView('reports')}>
+            <div><div style={{ fontWeight: 600, fontSize: 13.5 }}>Generate RSMI / RSPI</div><div style={{ fontSize: 11.5, color: '#5c7079' }}>Auto-compiled from posted issuances</div></div>
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function StatCard({ label, value, sub, accent }) {
+  return (
+    <div style={styles.statCard}>
+      <div style={{ fontSize: 26, fontWeight: 700, color: '#f2f5f6', marginTop: 4, fontFamily: 'ui-monospace, monospace' }}>{value}</div>
+      <div style={{ fontSize: 12.5, color: '#8fa3ad', marginTop: 2 }}>{label}</div>
+      <div style={{ fontSize: 10.5, color: '#5c7079', marginTop: 6 }}>{sub}</div>
+      <div style={{ height: 3, width: 28, background: accent, borderRadius: 2, marginTop: 10 }}></div>
+    </div>
+  );
+}
+
+function EmptyState({ text }) { return <div style={{ padding: '32px 16px', textAlign: 'center', color: '#5c7079', fontSize: 12.5, lineHeight: 1.6 }}>{text}</div>; }
+
+function ItemsList({ items, balanceOf, onSelect }) {
+  const groups = [CLASS.CONSUMABLE, CLASS.SEMI_EXPENDABLE, CLASS.PPE];
+  return (
+    <div>
+      {groups.map(g => {
+        const list = items.filter(i => i.classification === g);
+        if (list.length === 0) return null;
+        return (
+          <div key={g} style={{ marginBottom: 24 }}>
+            <div style={styles.groupLabel}>{g} <span style={{ color: '#5c7079', fontWeight: 400 }}>({list.length})</span></div>
+            <div style={styles.itemGrid}>
+              {list.map(item => (
+                <button key={item.id} style={styles.itemCard} onClick={() => onSelect(item.id)}>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                    <div style={styles.itemCode}>{item.code}</div>
+                  </div>
+                  <div style={styles.itemName}>{item.name}</div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-end', marginTop: 14 }}>
+                    <div style={{ fontSize: 10.5, color: '#5c7079' }}>{item.unit}</div>
+                    <div style={{ fontSize: 20, fontWeight: 700, fontFamily: 'ui-monospace, monospace', color: balanceOf(item.id) < 0 ? '#d9645c' : '#e8ecee' }}>{balanceOf(item.id)}</div>
+                  </div>
+                </button>
+              ))}
+            </div>
+          </div>
+        );
+      })}
+      {items.length === 0 && <EmptyState text="No items match your search." />}
+    </div>
+  );
+}
+
+function ItemCard({ item, rows, onBack, onDelete }) {
+  if (!item) return null;
+  const balance = rows.length ? rows[rows.length - 1].balance : 0;
+  return (
+    <div>
+      <button onClick={onBack} style={styles.backLink}>← Back to registry</button>
+      <div style={styles.cardHeader}>
+        <div>
+          <div style={{ fontSize: 11, color: '#5c7079', letterSpacing: '0.06em', textTransform: 'uppercase' }}>{item.classification}</div>
+          <div style={{ fontSize: 22, fontWeight: 700, color: '#f2f5f6', marginTop: 4 }}>{item.name}</div>
+          <div style={{ fontSize: 12.5, color: '#8fa3ad', marginTop: 4 }}>{item.code} · unit: {item.unit}</div>
+        </div>
+        <div style={{ textAlign: 'right' }}>
+          <div style={{ fontSize: 11, color: '#5c7079' }}>CURRENT BALANCE</div>
+          <div style={{ fontSize: 34, fontWeight: 700, fontFamily: 'ui-monospace, monospace', color: balance < 0 ? '#d9645c' : '#4f9d8f' }}>{balance}</div>
+        </div>
+      </div>
+      <div style={styles.panel}>
+        <div style={styles.panelHead}>Transaction History <span style={{ color: '#5c7079', fontWeight: 400 }}>· perpetual, chronological</span></div>
+        {rows.length === 0 ? <EmptyState text="No postings for this item yet." /> : (
+          <table style={styles.table}>
+            <thead><tr>
+              <th style={styles.th}>Date</th><th style={styles.th}>Type</th><th style={styles.th}>Document</th>
+              <th style={styles.th}>Recipient / Source</th><th style={{ ...styles.th, textAlign: 'right' }}>Qty</th>
+              <th style={{ ...styles.th, textAlign: 'right' }}>Balance</th><th style={styles.th}></th>
+            </tr></thead>
+            <tbody>
+              {[...rows].reverse().map(r => (
+                <tr key={r.id}>
+                  <td style={styles.td}>{fmtDate(r.date)}</td>
+                  <td style={styles.td}><span style={{ ...styles.txTypeBadge, ...badgeStyle(r.type) }}>{r.type.replace('_', ' ')}</span></td>
+                  <td style={styles.td}>{r.docType} #{r.docNumber || '—'}</td>
+                  <td style={styles.td}>{r.party || '—'}</td>
+                  <td style={{ ...styles.td, textAlign: 'right', fontFamily: 'ui-monospace, monospace', color: r.delta >= 0 ? '#4f9d8f' : '#d9645c' }}>{r.delta >= 0 ? '+' : ''}{r.delta}</td>
+                  <td style={{ ...styles.td, textAlign: 'right', fontFamily: 'ui-monospace, monospace', fontWeight: 700 }}>{r.balance}</td>
+                  <td style={{ ...styles.td, textAlign: 'right' }}><button onClick={() => onDelete(r.id)} style={styles.iconBtn}>✕</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TransactionEntry({ items, onSubmit, balanceOf }) {
+  const [itemId, setItemId] = useState('');
+  const [type, setType] = useState('RECEIPT');
+  const [date, setDate] = useState(todayISO());
+  const [qty, setQty] = useState('');
+  const [docNumber, setDocNumber] = useState('');
+  const [party, setParty] = useState('');
+  const [remarks, setRemarks] = useState('');
+  const item = items.find(i => i.id === itemId);
+  const docType = item ? (type === 'ISSUANCE' ? DOC_BY_TYPE.ISSUANCE[item.classification] : (DOC_BY_TYPE[type] ? DOC_BY_TYPE[type][0] : 'ADJ')) : '—';
+  const handleSubmit = () => { onSubmit({ itemId, type, date, qty, docType, docNumber, party, remarks }); setQty(''); setDocNumber(''); setParty(''); setRemarks(''); };
+  return (
+    <div style={{ maxWidth: 640 }}>
+      <div style={styles.panel}>
+        <div style={styles.panelHead}>New Posting</div>
+        <div style={styles.formGrid}>
+          <Field label="Item">
+            <select style={styles.select} value={itemId} onChange={e => setItemId(e.target.value)}>
+              <option value="">Select item…</option>
+              {items.map(i => <option key={i.id} value={i.id}>{i.code} — {i.name}</option>)}
+            </select>
+          </Field>
+          {item && <div style={styles.balancePreview}>Current balance: <strong>{balanceOf(item.id)}</strong> {item.unit}</div>}
+          <Field label="Transaction Type">
+            <select style={styles.select} value={type} onChange={e => setType(e.target.value)}>
+              {TX_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+            </select>
+          </Field>
+          <Field label="Date"><input type="date" style={styles.input} value={date} onChange={e => setDate(e.target.value)} max={todayISO()} /></Field>
+          <Field label={'Quantity ' + (type === 'ADJUSTMENT' ? '(use negative for downward adjustment)' : '')}>
+            <input type="number" style={styles.input} value={qty} onChange={e => setQty(e.target.value)} placeholder="0" />
+          </Field>
+          <Field label={'Source Document — ' + docType}>
+            <input style={styles.input} value={docNumber} onChange={e => setDocNumber(e.target.value)} placeholder={docType + ' number'} />
+          </Field>
+          <Field label={type === 'ISSUANCE' ? 'Issued To (office/person)' : type.includes('TRANSFER') ? 'Transfer Party' : 'Received From / Remarks'}>
+            <input style={styles.input} value={party} onChange={e => setParty(e.target.value)} placeholder="e.g. Records Section" />
+          </Field>
+          <Field label="Remarks (optional)"><input style={styles.input} value={remarks} onChange={e => setRemarks(e.target.value)} placeholder="Optional notes" /></Field>
+          <button style={styles.primaryBtn} onClick={handleSubmit}>+ Post Transaction</button>
+        </div>
+      </div>
+      <div style={styles.hintBox}><strong style={{ color: '#8fa3ad' }}>Reminder:</strong> Post same-day, on the date the physical event happened — receipt on IAR acceptance date, issuance on the date goods actually left custody.</div>
+    </div>
+  );
+}
+
+function Field({ label, children }) { return <label style={{ display: 'block', marginBottom: 14 }}><div style={styles.fieldLabel}>{label}</div>{children}</label>; }
+
+function Reports({ items, generateReport }) {
+  const [tab, setTab] = useState('RSMI');
+  const classification = tab === 'RSMI' ? CLASS.CONSUMABLE : CLASS.SEMI_EXPENDABLE;
+  const periodType = tab === 'RSMI' ? 'month' : 'week';
+  const groups = generateReport(classification, periodType);
+  const periods = Object.keys(groups).sort().reverse();
+  const [expanded, setExpanded] = useState(null);
+  useEffect(() => { setExpanded(periods[0] || null); }, [tab]);
+
+  return (
+    <div>
+      <div style={styles.tabRow}>
+        <button style={{ ...styles.tab, ...(tab === 'RSMI' ? styles.tabActive : {}) }} onClick={() => setTab('RSMI')}>RSMI <span style={{ fontSize: 10.5, opacity: 0.7 }}>· Consumables · Monthly</span></button>
+        <button style={{ ...styles.tab, ...(tab === 'RSPI' ? styles.tabActive : {}) }} onClick={() => setTab('RSPI')}>RSPI <span style={{ fontSize: 10.5, opacity: 0.7 }}>· Semi-Expendable · Weekly</span></button>
+      </div>
+      <div style={styles.hintBox}>
+        {tab === 'RSMI' ? 'Report of Supplies and Materials Issued — compiled from posted RIS transactions, grouped by month. Source: consumable items only.'
+        : 'Report of Semi-Expendable Property Issued — compiled from posted ICS transactions, grouped by week, per COA Circular No. 2022-004. PPE issuances (PAR) are not included in RSPI.'}
+      </div>
+      {periods.length === 0 ? <EmptyState text={'No ' + (tab === 'RSMI' ? 'issuances' : 'semi-expendable issuances') + ' posted yet.'} /> : periods.map(period => {
+        const rows = groups[period];
+        const isOpen = expanded === period;
+        const totalQty = rows.reduce((s, r) => s + Math.abs(Number(r.qty)), 0);
+        return (
+          <div key={period} style={styles.panel}>
+            <button style={styles.reportPeriodHead} onClick={() => setExpanded(isOpen ? null : period)}>
+              <span style={{ fontWeight: 600, fontSize: 13.5 }}>{periodType === 'week' ? 'Week of ' + fmtDate(period) : new Date(period + '-01').toLocaleDateString('en-PH', { year: 'numeric', month: 'long' })}</span>
+              <span style={{ fontSize: 12, color: '#8fa3ad' }}>{rows.length} entries · {totalQty} units</span>
+            </button>
+            {isOpen && (
+              <table style={styles.table}>
+                <thead><tr><th style={styles.th}>Date</th><th style={styles.th}>Item</th><th style={styles.th}>{tab === 'RSMI' ? 'RIS #' : 'ICS #'}</th><th style={styles.th}>Issued To</th><th style={{ ...styles.th, textAlign: 'right' }}>Qty</th></tr></thead>
+                <tbody>
+                  {rows.map(r => {
+                    const item = items.find(i => i.id === r.itemId);
+                    return (
+                      <tr key={r.id}>
+                        <td style={styles.td}>{fmtDate(r.date)}</td><td style={styles.td}>{item ? item.name : '—'}</td>
+                        <td style={styles.td}>{r.docNumber || '—'}</td><td style={styles.td}>{r.party || '—'}</td>
+                        <td style={{ ...styles.td, textAlign: 'right', fontFamily: 'ui-monospace, monospace' }}>{Math.abs(r.qty)}</td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function ItemFormModal({ onClose, onSubmit }) {
+  const [code, setCode] = useState('');
+  const [name, setName] = useState('');
+  const [classification, setClassification] = useState(CLASS.CONSUMABLE);
+  const [unit, setUnit] = useState('');
+  return (
+    <div style={styles.modalOverlay} onClick={onClose}>
+      <div style={styles.modal} onClick={e => e.stopPropagation()}>
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 18 }}>
+          <div style={{ fontSize: 16, fontWeight: 700, color: '#f2f5f6' }}>Add Item to Registry</div>
+          <button onClick={onClose} style={styles.iconBtn}>✕</button>
+        </div>
+        <Field label="Classification">
+          <select style={styles.select} value={classification} onChange={e => setClassification(e.target.value)}>
+            {Object.values(CLASS).map(c => <option key={c} value={c}>{c}</option>)}
+          </select>
+        </Field>
+        <Field label="Item Code"><input style={styles.input} value={code} onChange={e => setCode(e.target.value)} placeholder="e.g. CON-0002" /></Field>
+        <Field label="Item Name / Description"><input style={styles.input} value={name} onChange={e => setName(e.target.value)} placeholder="e.g. Ballpoint Pen, black" /></Field>
+        <Field label="Unit of Measure"><input style={styles.input} value={unit} onChange={e => setUnit(e.target.value)} placeholder="e.g. piece, box, unit" /></Field>
+        <button style={styles.primaryBtn} onClick={() => onSubmit({ code, name, classification, unit })}>Add Item</button>
+      </div>
+    </div>
+  );
+}
+
+function Toast({ msg, kind }) {
+  return <div style={{ ...styles.toast, ...(kind === 'error' ? styles.toastError : {}) }}>{msg}</div>;
+}
+
+function badgeStyle(type) {
+  switch (type) {
+    case 'RECEIPT': return { background: '#4f9d8f22', color: '#4f9d8f' };
+    case 'ISSUANCE': return { background: '#d9645c22', color: '#d9645c' };
+    case 'TRANSFER_IN': return { background: '#5c8fc922', color: '#5c8fc9' };
+    case 'TRANSFER_OUT': return { background: '#c98a3e22', color: '#c98a3e' };
+    default: return { background: '#7a6fd622', color: '#7a6fd6' };
+  }
+}
+
+const styles = {
+  app: { display: 'flex', minHeight: '100vh', background: '#141a1f' },
+  sidebar: { width: 240, background: '#10151a', borderRight: '1px solid #232b31', padding: '22px 16px', display: 'flex', flexDirection: 'column', flexShrink: 0 },
+  brandBlock: { display: 'flex', alignItems: 'center', gap: 10, padding: '0 6px' },
+  brandMark: { width: 34, height: 34, borderRadius: 8, background: 'linear-gradient(135deg, #4f9d8f, #2f6b60)', color: '#fff', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 13, fontFamily: 'ui-monospace, monospace' },
+  brandTitle: { fontSize: 13, fontWeight: 700, color: '#f2f5f6', lineHeight: 1.3 },
+  brandSub: { fontSize: 10.5, color: '#5c7079', marginTop: 1 },
+  navBtn: { display: 'flex', alignItems: 'center', gap: 10, width: '100%', padding: '9px 12px', background: 'transparent', border: 'none', borderRadius: 7, color: '#8fa3ad', fontSize: 13, cursor: 'pointer', marginBottom: 2, textAlign: 'left', fontFamily: 'inherit' },
+  navBtnActive: { background: '#1c2830', color: '#e8ecee' },
+  sidebarFoot: { marginTop: 'auto', paddingTop: 18, borderTop: '1px solid #232b31' },
+  main: { flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 },
+  topbar: { height: 60, borderBottom: '1px solid #232b31', display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '0 28px', flexShrink: 0 },
+  topbarTitle: { fontSize: 15, fontWeight: 700, color: '#f2f5f6' },
+  content: { flex: 1, overflowY: 'auto', padding: '24px 28px 48px' },
+  searchBox: { display: 'flex', alignItems: 'center', gap: 6, background: '#1c2830', border: '1px solid #2a343c', borderRadius: 7, padding: '6px 10px' },
+  searchInput: { background: 'transparent', border: 'none', outline: 'none', color: '#e8ecee', fontSize: 12.5, width: 160, fontFamily: 'inherit' },
+  primaryBtnSm: { background: '#4f9d8f', color: '#0d1512', border: 'none', borderRadius: 7, padding: '7px 12px', fontSize: 12.5, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit' },
+  primaryBtn: { display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 7, background: '#4f9d8f', color: '#0d1512', border: 'none', borderRadius: 8, padding: '11px 16px', fontSize: 13.5, fontWeight: 700, cursor: 'pointer', width: '100%', marginTop: 6, fontFamily: 'inherit' },
+  statGrid: { display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 14, marginBottom: 22 },
+  statCard: { background: '#1a2126', border: '1px solid #232b31', borderRadius: 12, padding: '18px 18px 16px' },
+  alertBox: { display: 'flex', gap: 12, alignItems: 'flex-start', background: '#2a2015', border: '1px solid #4a3a1f', borderRadius: 10, padding: '13px 16px', marginBottom: 22 },
+  twoCol: { display: 'grid', gridTemplateColumns: '1.4fr 1fr', gap: 16 },
+  panel: { background: '#1a2126', border: '1px solid #232b31', borderRadius: 12, padding: 18, marginBottom: 16 },
+  panelHead: { fontSize: 12.5, fontWeight: 700, color: '#e8ecee', marginBottom: 14, textTransform: 'uppercase', letterSpacing: '0.04em' },
+  txRow: { display: 'flex', alignItems: 'center', padding: '9px 0', borderBottom: '1px solid #202830' },
+  txTypeBadge: { fontSize: 10, fontWeight: 700, padding: '3px 8px', borderRadius: 5, textTransform: 'uppercase', letterSpacing: '0.03em', whiteSpace: 'nowrap' },
+  quickAction: { display: 'flex', gap: 12, alignItems: 'center', width: '100%', background: '#1c2830', border: '1px solid #2a343c', borderRadius: 9, padding: '12px 14px', cursor: 'pointer', marginBottom: 8, textAlign: 'left', fontFamily: 'inherit', color: '#c5d1d6' },
+  groupLabel: { fontSize: 12.5, fontWeight: 700, color: '#e8ecee', marginBottom: 10, textTransform: 'uppercase', letterSpacing: '0.04em' },
+  itemGrid: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(200px, 1fr))', gap: 12 },
+  itemCard: { background: '#1a2126', border: '1px solid #232b31', borderRadius: 11, padding: 16, textAlign: 'left', cursor: 'pointer', fontFamily: 'inherit', color: '#c5d1d6' },
+  itemCode: { fontSize: 10.5, color: '#5c7079', fontFamily: 'ui-monospace, monospace', fontWeight: 600 },
+  itemName: { fontSize: 13.5, color: '#e8ecee', marginTop: 8, fontWeight: 600, lineHeight: 1.3 },
+  backLink: { background: 'none', border: 'none', color: '#8fa3ad', fontSize: 12.5, cursor: 'pointer', marginBottom: 16, padding: 0, fontFamily: 'inherit' },
+  cardHeader: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', background: '#1a2126', border: '1px solid #232b31', borderRadius: 12, padding: 20, marginBottom: 16 },
+  table: { width: '100%', borderCollapse: 'collapse' },
+  th: { textAlign: 'left', fontSize: 10.5, color: '#5c7079', textTransform: 'uppercase', letterSpacing: '0.04em', padding: '8px 10px', borderBottom: '1px solid #232b31' },
+  td: { fontSize: 12.5, color: '#c5d1d6', padding: '10px 10px', borderBottom: '1px solid #1c2429' },
+  formGrid: { display: 'flex', flexDirection: 'column' },
+  fieldLabel: { fontSize: 11.5, color: '#8fa3ad', marginBottom: 6, fontWeight: 600 },
+  input: { width: '100%', background: '#10151a', border: '1px solid #2a343c', borderRadius: 7, padding: '9px 11px', color: '#e8ecee', fontSize: 13, outline: 'none', fontFamily: 'inherit', boxSizing: 'border-box' },
+  select: { width: '100%', background: '#10151a', border: '1px solid #2a343c', borderRadius: 7, padding: '9px 11px', color: '#e8ecee', fontSize: 13, outline: 'none', fontFamily: 'inherit', boxSizing: 'border-box' },
+  balancePreview: { fontSize: 12, color: '#8fa3ad', background: '#10151a', border: '1px dashed #2a343c', borderRadius: 7, padding: '9px 11px', marginBottom: 14 },
+  hintBox: { fontSize: 12, color: '#7d939d', background: '#161d22', border: '1px solid #202830', borderRadius: 9, padding: '12px 14px', lineHeight: 1.6, marginBottom: 16 },
+  tabRow: { display: 'flex', gap: 8, marginBottom: 16 },
+  tab: { background: '#1a2126', border: '1px solid #232b31', borderRadius: 8, padding: '9px 14px', color: '#8fa3ad', fontSize: 12.5, fontWeight: 600, cursor: 'pointer', fontFamily: 'inherit' },
+  tabActive: { background: '#1c2830', borderColor: '#3a4a54', color: '#e8ecee' },
+  reportPeriodHead: { display: 'flex', justifyContent: 'space-between', alignItems: 'center', width: '100%', background: 'none', border: 'none', cursor: 'pointer', padding: '4px 2px', fontFamily: 'inherit', color: '#e8ecee' },
+  modalOverlay: { position: 'fixed', inset: 0, background: '#000000aa', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 50, padding: 20 },
+  modal: { background: '#1a2126', border: '1px solid #2a343c', borderRadius: 14, padding: 22, width: 380, maxWidth: '100%' },
+  iconBtn: { background: 'none', border: 'none', color: '#5c7079', cursor: 'pointer', padding: 4, display: 'flex', fontSize: 13 },
+  toast: { position: 'fixed', bottom: 24, right: 24, background: '#1c2830', border: '1px solid #4f9d8f', color: '#e8ecee', padding: '11px 16px', borderRadius: 9, fontSize: 12.5, zIndex: 60, boxShadow: '0 8px 24px #00000055' },
+  toastError: { borderColor: '#d9645c' },
+};
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
